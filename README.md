@@ -29,6 +29,35 @@ Hooks `CHAT_COMPLETION_SETTINGS_READY` and rewrites the outgoing request payload
    multi-turn chats. Off by default; requires the SillyTavern **Show thoughts** toggle to be on
    (reasoning is only persisted then). Note: prior reasoning is billed as input tokens.
 
+### How prior reasoning is matched to messages
+
+The payload carries no message identifiers, so a stored reasoning has to be paired with a message in
+the request. Two sources are used, in order of trust:
+
+1. **Core-attached `reasoning`** — newer SillyTavern versions copy the stored reasoning onto the
+   payload message built from that same chat entry, so it is aligned by construction. It only needs
+   renaming to `reasoning_content`; nothing is guessed. The original `reasoning` field is left in
+   place for sources that read that name.
+2. **Text matching** — for messages the core left bare (older versions, or reasoning withheld because
+   the turn came from a different model/API), chat and payload are walked from the **newest** end.
+   A payload message is paired with the newest chat message at or below the cursor with matching
+   text; the cursor never advances on a miss, so a message that exists only in the payload (preset
+   prefill, injected turn) simply gets nothing and cannot shift the pairing of the others.
+
+Matching from the start of the conversation instead — positional 1:1 pairing — is the bug this
+guards against: once SillyTavern drops older messages for context limits, the payload no longer
+starts at the same turn as the chat, every later pair is off by the number of trimmed messages, and
+old reasoning lands on new turns. Other cases the walk accounts for:
+
+- **Swipe** — the core drops the last chat message from the payload, so it is skipped here too.
+- **Hidden turns** (`Symbol.for('ignore')`) never reach the payload and are skipped.
+- **Macros** in stored text are substituted before matching, so `{{char}} waves.` matches the
+  substituted form the payload carries.
+- **Duplicate texts** pair newest-to-newest; if the payload holds more copies than the chat, the
+  extras are left bare (a lost attachment, never a swapped one).
+- Turns with no stored reasoning are not candidates at all, so a stretch of non-reasoning turns does
+  not consume the matching positions of the others.
+
 ## Guards (mirroring the patch)
 
 - Only runs when the current model id matches the configurable filter (default `kimi,moonshot`,
@@ -50,7 +79,8 @@ Extensions menu → **Kimi Thinking Prefill**:
   this extension modifies. **Required**: with thinking disabled the model continues the seeded
   `reasoning_content` with reply text and never reasons (reply shows up inside the reasoning panel).
 - **Send all prior assistant reasoning back to the API** (default: off) — the preserved-thinking
-  feature above. Pairs chat messages to outgoing assistant messages 1:1 (system messages excluded).
+  feature above. Reasons are matched to payload messages from the end of the conversation; see
+  [How prior reasoning is matched to messages](#how-prior-reasoning-is-matched-to-messages).
 - **Log decisions to browser console** — debug output for each guarded decision.
 
 ## Verification

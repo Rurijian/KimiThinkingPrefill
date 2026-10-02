@@ -8,10 +8,16 @@
 //      starts with a leading think block (see THINK_REGEX), the block is moved
 //      into `reasoning_content` and the message is flagged `partial: true`
 //      (identical transform to the patched addAssistantPrefix).
-//   2. Re-attach: re-populates `reasoning_content` on every prior assistant
-//      message from the stored `extra.reasoning` chat field, so providers that
-//      require prior reasoning to be passed back do not return a 400. Gated by
-//      the `send_all_thinking` setting.
+//   2. Re-attach: re-populates `reasoning_content` on prior assistant messages
+//      from the stored `extra.reasoning` chat field, so providers that require
+//      prior reasoning to be passed back do not return a 400. Gated by the
+//      `send_all_thinking` setting.
+//      Two sources, in order of trust (see attachPriorReasoning):
+//        a. `reasoning` as the core attached it to the payload message built from
+//           that same chat entry — aligned by construction, only renamed.
+//        b. text matching, walking chat and payload from the NEWEST end, for
+//           messages the core left bare. A positional walk from the start of the
+//           conversation misassigns reasoning once the core trims old messages.
 //   3. Injection: if the last message is NOT an assistant message and the user
 //      has configured a reasoning prefill below, a trailing assistant message
 //      { role: 'assistant', content: '', reasoning_content: prefill, partial: true }
@@ -22,7 +28,7 @@
 // continue/impersonate/quiet generations.
 
 import { extension_settings } from '../../../extensions.js';
-import { saveSettingsDebounced } from '../../../../script.js';
+import { saveSettingsDebounced, substituteParams } from '../../../../script.js';
 
 const { eventSource, event_types } = SillyTavern.getContext();
 
@@ -115,16 +121,62 @@ function applyThinkTransform(message) {
 }
 
 /**
+ * Normalizes message text into a matching key. Macros in the stored chat text
+ * are substituted, so a message containing {{macros}} matches the substituted
+ * text the payload actually carries.
+ * @param {string} text Message content
+ * @returns {string|null} Normalized key, or null for text that cannot match
+ */
+function matchKey(text) {
+    if (typeof text !== 'string') return null;
+    if (text.includes('{{')) {
+        try {
+            text = substituteParams(text);
+        } catch (error) {
+            console.warn(`[${extensionName}] Macro substitution failed while matching:`, error);
+        }
+    }
+    const key = text.replace(/\r/g, '').trim();
+    return key || null;
+}
+
+/**
+ * Shortens text for debug output.
+ * @param {string} text Text to shorten
+ * @param {number} length Maximum length
+ * @returns {string} Possibly truncated text
+ */
+function preview(text, length = 32) {
+    const value = String(text ?? '');
+    return value.length > length ? `${value.slice(0, length)}…` : value;
+}
+
+/**
  * Re-attaches stored reasoning (extra.reasoning) from past assistant chat
  * messages to the matching role:'assistant' entries in the outgoing messages
  * array. SillyTavern stores reasoning at chat[i].extra.reasoning but does not
  * forward it to the API on its own.
  *
- * Matching strategy: non-user chat messages map 1:1, in order, to the
- * role:'assistant' entries in the outgoing payload. System prompts, summaries
- * and dialogue examples are all role:'system' so they do not perturb the
- * assistant count. The pairing uses Math.min so a trailing preset prefill
- * (which has no chat counterpart) is simply left unpaired.
+ * Matching strategy: the payload carries no message identifiers — by the time
+ * the request is built every message has been rebuilt from role/content only —
+ * so the correspondence has to be recovered from the text itself. Both lists
+ * are walked from the NEWEST end and a payload message is paired with the first
+ * chat message below the cursor whose key matches. The cursor only moves down
+ * and is NOT advanced by a payload message that matches nothing, so a message
+ * present in the payload but not in the chat (a preset prefill, a user
+ * injection, any number of them, anywhere) gets no reasoning and cannot shift
+ * the pairing of the other messages. Walking from the start of the conversation
+ * instead (positional 1:1 pairing) misassigns reasoning as soon as the core
+ * trims older messages off the head of the chat history: the payload no longer
+ * starts at the same turn as the chat, so every later pair is off by the number
+ * of trimmed messages and old reasoning lands on new turns.
+ *
+ * Two things the core does on its own still have to be mirrored:
+ *   - On swipe the core drops the last chat message from the payload, so it is
+ *     skipped here as well. On regenerate the core instead removes the message
+ *     from the chat itself, which is why no pop is needed for that type.
+ *   - Messages flagged with the shared IGNORE_SYMBOL never reach the payload and
+ *     are skipped so they cannot claim a payload message's text.
  * @param {object} generateData Outgoing request payload
  * @returns {number} How many messages had reasoning attached
  */
@@ -135,24 +187,93 @@ function attachPriorReasoning(generateData) {
     const chat = SillyTavern.getContext().chat;
     if (!Array.isArray(chat)) return 0;
 
-    const chatAssistantMsgs = chat.filter(m => m && !m.is_user && !m.is_system);
+    const IGNORE_SYMBOL = Symbol.for('ignore');
+    // Chat assistant messages, newest first (filter keeps the chat order, so
+    // reverse it before walking from the tail).
+    const chatAssistantMsgs = chat
+        .filter(m => m && !m.is_user && !m.is_system && !m.extra?.[IGNORE_SYMBOL])
+        .reverse();
+
+    if (lastGenerationType === 'swipe') {
+        chatAssistantMsgs.shift();
+    }
+
+    // Only messages that actually stored reasoning can become a candidate.
+    const candidates = chatAssistantMsgs
+        .filter(m => typeof m.extra?.reasoning === 'string' && m.extra.reasoning.trim())
+        .map(m => ({ key: matchKey(m.mes), reason: m.extra.reasoning }));
+
+    // Duplicate keys are the one case where a payload message takes a candidate
+    // belonging to a different turn: the newest payload message with a given
+    // text takes the newest candidate with that text, so other payload messages
+    // with the same text starve. The reasoning handed over still belongs to the
+    // same text, so it is a loss rather than a mix-up — worth reporting anyway.
+    const keyCounts = new Map();
+    for (const candidate of candidates) {
+        if (candidate.key === null) continue;
+        keyCounts.set(candidate.key, (keyCounts.get(candidate.key) ?? 0) + 1);
+    }
+    const duplicateKeys = [...keyCounts.values()].reduce((n, count) => n + (count > 1 ? count - 1 : 0), 0);
+
     const outgoingAssistantMsgs = generateData.messages.filter(m => m && m.role === 'assistant');
 
-    let attached = 0;
-    const count = Math.min(chatAssistantMsgs.length, outgoingAssistantMsgs.length);
-    for (let i = 0; i < count; i++) {
-        const reason = chatAssistantMsgs[i]?.extra?.reasoning;
-        if (reason && typeof reason === 'string' && reason.trim() && !outgoingAssistantMsgs[i].reasoning_content) {
-            outgoingAssistantMsgs[i].reasoning_content = reason;
-            attached++;
-        }
+    // Newer cores already copy the stored reasoning onto the payload message
+    // they build from that same chat entry, in the same loop as its content, so
+    // it arrives aligned by construction and needs no guessing. Only the field
+    // name is wrong for the Moonshot/DeepSeek lineage, which wants
+    // reasoning_content — mirror it there and leave `reasoning` in place for the
+    // sources that read that name.
+    let native = 0;
+    for (const message of outgoingAssistantMsgs) {
+        if (message.reasoning_content) continue;
+        if (typeof message.reasoning !== 'string' || !message.reasoning.trim()) continue;
+        message.reasoning_content = message.reasoning;
+        native++;
     }
 
-    if (attached > 0) {
-        ensureThinkingEnabled(generateData);
-        debugLog(`Attached reasoning_content to ${attached} prior assistant message(s).`);
+    // Fallback for messages the core left bare (older versions, or reasoning
+    // withheld because the chat turn came from another model/API): walk both
+    // lists from the newest end. A payload message that matches nothing is
+    // skipped without moving the cursor.
+    const matched = [];
+    const unmatchedTexts = [];
+    let cursor = 0;
+    for (let i = outgoingAssistantMsgs.length - 1; i >= 0; i--) {
+        const message = outgoingAssistantMsgs[i];
+        if (message.reasoning_content) continue;
+        const key = matchKey(message.content);
+        if (key === null) continue;
+        let j = cursor;
+        while (j < candidates.length && candidates[j].key !== key) j++;
+        if (j >= candidates.length) {
+            unmatchedTexts.push(preview(key));
+            continue;
+        }
+        matched.push({ message, reason: candidates[j].reason });
+        cursor = j + 1;
     }
-    return attached;
+    // Collected newest-first; flip so attachment order follows the chat.
+    matched.reverse();
+
+    for (const slot of matched) {
+        slot.message.reasoning_content = slot.reason;
+    }
+
+    if (native > 0 || matched.length > 0) {
+        ensureThinkingEnabled(generateData);
+    }
+    if (native > 0 || matched.length > 0 || unmatchedTexts.length > 0) {
+        debugLog(`Prior reasoning: ${native} message(s) from core-attached \`reasoning\`, ${matched.length} matched by text, ${unmatchedTexts.length} payload message(s) unmatched, ${outgoingAssistantMsgs.length} assistant message(s) in payload, ${duplicateKeys} duplicate key(s), generation type "${lastGenerationType ?? 'unknown'}".`);
+        // Pairing counts cannot tell "paired the wrong way round" from "the chat
+        // data itself disagrees" (text and stored reasoning are edited
+        // independently), so the pairs themselves are logged.
+        debugLog('Prior reasoning detail:', {
+            matched: matched.map(s => [preview(s.message.content), preview(s.message.reasoning_content)]),
+            unmatchedTexts,
+            candidates: candidates.map(c => [preview(c.key), preview(c.reason)]),
+        });
+    }
+    return native + matched.length;
 }
 
 /**
