@@ -98,3 +98,12 @@ with request logging), the final message should look like:
 - Works with the direct Moonshot source, OpenRouter (Moonshot provider), and Custom endpoints —
   anywhere the model id matches the filter and the API honors `partial`/`reasoning_content`.
 - The server patch is *not* required; do not run both (double transforms are harmless but pointless).
+
+## Credits
+
+- The end-of-conversation alignment of prior reasoning — walking chat and payload from the newest
+  end with a one-way cursor, and the swipe / hidden-turn / macro cases it depends on — is
+  [kolobanaga](https://github.com/kolobanaga)'s fix, from their fork
+  [KTPEnhanced](https://github.com/kolobanaga/KTPEnhanced). Thank you :3
+- The `reasoning_content` prefill technique itself follows the
+  [kimi-k3-jb patch](https://rentry.org/kimi-k3-jb).
